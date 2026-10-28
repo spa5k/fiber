@@ -1960,6 +1960,18 @@ The session middleware has undergone significant improvements in v3, focusing on
 
 - **Session ID Write-Back**: When a request already carries a session ID, the ID is written back only through the extractor that supplied it, and only when that extractor is a cookie or a non-Authorization header. An ID from a read-only source (Authorization header, Query, Form, Param, or Custom) is never copied into a cookie or header, which prevents session fixation. A request without an ID gets a server-generated one through every cookie and non-Authorization header extractor of the chain. When the middleware issues a new ID for a request that carried one, because of `Regenerate()`, `Reset()`, or an ID the storage does not know, the new ID goes back through the same cookie or header, or through every such extractor of the chain when the old ID came from a read-only source. An extractor error other than `extractors.ErrNotFound` is passed to `ErrorHandler` instead of being treated as a new visitor.
 
+- **Several Sessions per Request**: Give each session its own middleware over its own cookie or header and reach it with `Store.FromContext`, for example a short-lived login-flow session next to the session that keeps the user signed in. A store no longer adopts the session ID that a store over other cookies cached on the request, which used to make the second session fail to persist, or alias the first one over a shared storage. Stores that read the same cookie still agree on one ID. See [Multiple Sessions per Request](./middleware/session.md#multiple-sessions-per-request).
+
+- **`SkipEmptySessions`**: Keeps a new session that holds no data out of the storage and out of the response, so clients that send no cookies, such as health checks and crawlers, stop leaving a record behind with every request. Off by default. See [Skipping Empty Sessions](./middleware/session.md#skipping-empty-sessions).
+
+- **Storage Key Policy**: `StorageKeyPrefix` keeps the sessions of applications, environments or stores that share a storage apart, and `HashStorageKeys` stores each session under the SHA-256 digest of its ID, so that what a backup or a leaked dump of the storage holds cannot be sent as a session cookie. Both are off by default. See [Storage Keys](./middleware/session.md#storage-keys).
+
+- **Lifetime Capped by `AbsoluteTimeout`**: Near the end of a session, a save keeps the record and sets the cookie only for the time that is left, never for less than one second, instead of for the full idle timeout.
+
+- **Startup Checks**: A `Storage` that is a typed nil, such as an unset `*redis.Storage`, panics when the middleware or the store is created instead of on the first request. A warning is logged for a `__Host-` or `__Secure-` session cookie that breaks the rules browsers enforce for those prefixes; the configuration is still accepted.
+
+- **Typed Reads and Expiry Getters**: `session.GetAs[V]` reads a value as a given type without a type assertion and accepts a `nil` session. `IdleTimeout()` and `AbsoluteExpiry()` on `Session` and `Middleware` report when a session ends.
+
 For more details on these changes and migration instructions, check the [Session Middleware Migration Guide](./middleware/session.md#migration-guide).
 
 ### SSE
