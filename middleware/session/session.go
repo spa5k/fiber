@@ -156,6 +156,52 @@ func (s *Session) Get(key any) any {
 	return s.data.Get(key)
 }
 
+// GetAs returns the value stored under key as a V, and whether it is one: ok is
+// false when the key is absent or holds a value of another type, and the zero
+// value is returned with it. It spares the type assertion, and with it the
+// panic of an unchecked one.
+//
+// src is a *Session or a *Middleware. A nil one finds nothing, so the result of
+// FromContext can be passed as it is.
+//
+// Like Get, it gives up the saved snapshot when the value it returns could share
+// memory with the session (a map, slice, array, pointer or struct).
+//
+// Parameters:
+//   - src: The session or middleware to read from.
+//   - key: The key to retrieve.
+//
+// Returns:
+//   - V: The value, or the zero value of V.
+//   - bool: True if the key holds a V; otherwise, false.
+//
+// Usage:
+//
+//	name, ok := session.GetAs[string](session.FromContext(c), "name")
+func GetAs[V any](src interface{ Get(key any) any }, key any) (V, bool) {
+	var zero V
+	switch typed := src.(type) {
+	case nil:
+		return zero, false
+	case *Middleware:
+		if typed == nil {
+			return zero, false
+		}
+	case *Session:
+		if typed == nil {
+			return zero, false
+		}
+	default:
+		// Any other reader is trusted to cope with a missing key.
+	}
+
+	value, ok := src.Get(key).(V)
+	if !ok {
+		return zero, false
+	}
+	return value, true
+}
+
 // Set updates or creates a new key-value pair in the session.
 //
 // Parameters:
@@ -222,7 +268,7 @@ func (s *Session) DestroyWithContext(ctx context.Context) error {
 	defer s.mu.Unlock()
 
 	// Use external Storage if exist
-	if err := s.config.Storage.DeleteWithContext(ctx, s.id); err != nil {
+	if err := s.config.Storage.DeleteWithContext(ctx, s.config.storageKey(s.id)); err != nil {
 		return err
 	}
 
@@ -267,7 +313,7 @@ func (s *Session) RegenerateWithContext(ctx context.Context) error {
 	defer s.mu.Unlock()
 
 	// Delete old id from storage
-	if err := s.config.Storage.DeleteWithContext(ctx, s.id); err != nil {
+	if err := s.config.Storage.DeleteWithContext(ctx, s.config.storageKey(s.id)); err != nil {
 		return err
 	}
 
@@ -308,7 +354,7 @@ func (s *Session) ResetWithContext(ctx context.Context) error {
 	defer s.mu.Unlock()
 
 	// Delete old id from storage
-	if err := s.config.Storage.DeleteWithContext(ctx, s.id); err != nil {
+	if err := s.config.Storage.DeleteWithContext(ctx, s.config.storageKey(s.id)); err != nil {
 		return err
 	}
 
@@ -376,8 +422,9 @@ func (s *Session) SaveWithContext(ctx context.Context) error {
 		return s.saveSessionWithContext(ctx)
 	}
 
-	// If the session is being used in the handler, it should not be saved
-	if m, ok := s.ctx.Locals(middlewareContextKey).(*Middleware); ok {
+	// If the session is being used in the handler, it should not be saved. With
+	// several session middleware registered, the one managing s may be an outer one.
+	for m, ok := s.ctx.Locals(middlewareContextKey).(*Middleware); ok && m != nil; m = m.parent {
 		if m.Session == s {
 			// Session is in use, so we do nothing and return
 			return nil
@@ -401,13 +448,16 @@ func (s *Session) saveSessionWithContext(ctx context.Context) error {
 		s.idleTimeout = s.config.IdleTimeout
 	}
 
+	// Neither the record nor the cookie may outlive the absolute deadline.
+	ttl := s.lifetime()
+
 	// Update client cookie
-	s.setSession()
+	s.setSession(ttl)
 
 	// Unchanged since the decode: write the snapshot back so the idle timeout still
 	// slides. Lock-free is enough; dirty is set before the mutation it reports.
 	if s.rawData != nil && !s.data.dirty.Load() {
-		return s.config.Storage.SetWithContext(ctx, s.id, s.rawData, s.idleTimeout)
+		return s.config.Storage.SetWithContext(ctx, s.config.storageKey(s.id), s.rawData, ttl)
 	}
 
 	// Encode session data
@@ -419,7 +469,31 @@ func (s *Session) saveSessionWithContext(ctx context.Context) error {
 	}
 
 	// Pass copied bytes with session id to provider
-	return s.config.Storage.SetWithContext(ctx, s.id, encodedBytes, s.idleTimeout)
+	return s.config.Storage.SetWithContext(ctx, s.config.storageKey(s.id), encodedBytes, ttl)
+}
+
+// minLifetime is the shortest lifetime the absolute deadline cuts a save down
+// to. Storages count whole seconds, and a shorter one could round down to zero,
+// which many of them read as "never expires".
+const minLifetime = time.Second
+
+// lifetime returns how long a save keeps the record and the cookie: the idle
+// timeout, cut down to the time left until the absolute deadline, but never
+// below minLifetime. A request that outlasts the deadline therefore still ends
+// with a record that expires at once, and never with one that does not expire.
+//
+// Returns:
+//   - time.Duration: The time to live for the storage and the cookie.
+func (s *Session) lifetime() time.Duration {
+	ttl := s.idleTimeout
+	if s.config.AbsoluteTimeout <= 0 {
+		return ttl
+	}
+	deadline := s.absExpiration()
+	if deadline.IsZero() {
+		return ttl
+	}
+	return min(ttl, max(time.Until(deadline), minLifetime))
 }
 
 // Keys retrieves all keys in the current session.
@@ -451,6 +525,43 @@ func (s *Session) SetIdleTimeout(idleTimeout time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.idleTimeout = idleTimeout
+}
+
+// IdleTimeout returns the idle timeout the next save applies: the one set with
+// SetIdleTimeout, or else the store's. It is not kept between requests, so a
+// timeout set with SetIdleTimeout has to be set again by the next request.
+//
+// Returns:
+//   - time.Duration: The idle timeout of this session.
+//
+// Usage:
+//
+//	timeout := s.IdleTimeout()
+func (s *Session) IdleTimeout() time.Duration {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.idleTimeout > 0 || s.config == nil {
+		return s.idleTimeout
+	}
+	return s.config.IdleTimeout
+}
+
+// AbsoluteExpiry returns the time at which the session ends however active it
+// is, and whether it has such a time at all: a store without an AbsoluteTimeout
+// hands out sessions that only the idle timeout ends.
+//
+// Returns:
+//   - time.Time: The absolute expiration time, or the zero time.
+//   - bool: True if the session has an absolute expiration time; otherwise, false.
+//
+// Usage:
+//
+//	if expiry, ok := s.AbsoluteExpiry(); ok {
+//	    // warn the user when time.Until(expiry) is short
+//	}
+func (s *Session) AbsoluteExpiry() (time.Time, bool) {
+	expiry := s.absExpiration()
+	return expiry, !expiry.IsZero()
 }
 
 // getExtractorInfo returns all cookie and header extractors from the chain
@@ -507,7 +618,8 @@ func (s *Session) getExtractorInfo() []extractors.Extractor {
 	return sinks
 }
 
-func (s *Session) setSession() {
+// setSession writes the session ID to the response, with a lifetime of ttl.
+func (s *Session) setSession(ttl time.Duration) {
 	if s.ctx == nil {
 		return
 	}
@@ -530,8 +642,8 @@ func (s *Session) setSession() {
 			// Cookies are also session cookies if they do not specify the Expires or Max-Age attribute.
 			// refer: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Set-Cookie
 			if !s.config.CookieSessionOnly {
-				fcookie.SetMaxAge(int(s.idleTimeout.Seconds()))
-				fcookie.SetExpire(time.Now().Add(s.idleTimeout))
+				fcookie.SetMaxAge(int(ttl.Seconds()))
+				fcookie.SetExpire(time.Now().Add(ttl))
 			}
 
 			s.setCookieAttributes(fcookie)
@@ -642,6 +754,30 @@ func (s *Session) encodeSessionData() ([]byte, error) {
 	copy(encodedBytes, byteBuffer.Bytes())
 
 	return encodedBytes, nil
+}
+
+// isEmptyFresh reports whether the session is new and holds nothing a handler
+// stored in it. The absolute-timeout bookkeeping, which every new session of a
+// store with an AbsoluteTimeout carries, does not count.
+//
+// Returns:
+//   - bool: True if the session is fresh and has no data of its own; otherwise, false.
+func (s *Session) isEmptyFresh() bool {
+	s.mu.RLock()
+	fresh := s.isFresh
+	s.mu.RUnlock()
+	if !fresh || s.data == nil {
+		return false
+	}
+
+	s.data.RLock()
+	defer s.data.RUnlock()
+	for key := range s.data.Data {
+		if key != absExpirationKey {
+			return false
+		}
+	}
+	return true
 }
 
 // absExpiration returns the session absolute expiration time or a zero time if not set.

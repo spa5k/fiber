@@ -2,9 +2,12 @@ package session
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/gob"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -13,6 +16,8 @@ import (
 	"github.com/gofiber/fiber/v3/internal/ctxlocal"
 	"github.com/gofiber/fiber/v3/internal/storage/memory"
 	"github.com/gofiber/fiber/v3/log"
+	"github.com/gofiber/utils/v2"
+	utilsstrings "github.com/gofiber/utils/v2/strings"
 )
 
 // ErrEmptySessionID is an error that occurs when the session ID is empty.
@@ -30,6 +35,10 @@ const (
 	sessionIDContextKey sessionIDKey = iota
 	// sessionExtractorContextKey stores the extractor that provided the session ID.
 	sessionExtractorContextKey
+	// sessionOwnerContextKey stores the *Store whose Store.Get published the session
+	// ID, so that a store reading other cookies or headers does not adopt it. The
+	// session middleware publishes itself instead, and its config names the store.
+	sessionOwnerContextKey
 )
 
 // provenanceBox carries the resolved provenance through request locals behind a
@@ -37,25 +46,28 @@ const (
 // request carrying a session ID. fasthttp hands it back through Close on
 // request reset, as it does the extractors package's chain state.
 type provenanceBox struct {
-	res extractors.Result
+	// owner is the store whose extractor produced res.
+	owner *Store
+	res   extractors.Result
 }
 
 // A pointer so a test can swap in a pool of its own; nothing else reassigns it.
 var provenancePool = &sync.Pool{New: func() any { return new(provenanceBox) }}
 
-// storeProvenance records res in the request, reusing the box already there.
-// Overwriting the local with a fresh box would strand the old one outside the
-// pool: fasthttp only reclaims the box the local currently holds.
-func storeProvenance(c fiber.Ctx, res extractors.Result) {
+// storeProvenance records res, resolved by s, in the request, reusing the box
+// already there. Overwriting the local with a fresh box would strand the old
+// one outside the pool: fasthttp only reclaims the box the local currently
+// holds.
+func storeProvenance(c fiber.Ctx, s *Store, res extractors.Result) {
 	if b, ok := c.Locals(sessionExtractorContextKey).(*provenanceBox); ok && b != nil {
-		b.res = res
+		b.res, b.owner = res, s
 		return
 	}
 	b, ok := provenancePool.Get().(*provenanceBox)
 	if !ok || b == nil {
 		b = new(provenanceBox)
 	}
-	b.res = res
+	b.res, b.owner = res, s
 	ctxlocal.Set(c, sessionExtractorContextKey, b)
 }
 
@@ -63,13 +75,111 @@ func storeProvenance(c fiber.Ctx, res extractors.Result) {
 // io.Closer when it resets the request; callers should not.
 func (b *provenanceBox) Close() error {
 	b.res = extractors.Result{}
+	b.owner = nil
 	provenancePool.Put(b)
 	return nil
 }
 
 // Store manages session data using the configured storage backend.
 type Store struct {
+	// sources names the cookies and headers the store reads the session ID from
+	// and writes it back to, such as "cookie:session_id".
+	sources []string
 	Config
+}
+
+// writableSources lists the cookies and headers an extractor reads a session ID
+// from and the store can write one back to. Header names are lower-cased.
+func writableSources(ext extractors.Extractor) []string {
+	var sources []string
+	ext.Walk(func(candidate extractors.Extractor) bool {
+		if len(candidate.Chain) > 0 || candidate.Key == "" {
+			return true
+		}
+		switch candidate.Source {
+		case extractors.SourceCookie:
+			sources = append(sources, "cookie:"+candidate.Key)
+		case extractors.SourceHeader:
+			sources = append(sources, "header:"+utilsstrings.ToLower(candidate.Key))
+		default:
+			// A read-only source names nothing the store could write back to.
+		}
+		return true
+	})
+	return sources
+}
+
+// sharesSource reports whether s and other read the session ID from a common
+// cookie or header, or cannot be told apart because one of them names none.
+//
+// A request can hold the sessions of several stores. Stores over the same
+// cookie, such as a session middleware and the store the CSRF middleware was
+// given, resolve the same session and so share the ID cached on the request.
+// Stores over different cookies keep independent sessions: one adopting the
+// other's cached ID would look up a foreign session, or write its own ID to a
+// cookie it does not own.
+func (s *Store) sharesSource(other *Store) bool {
+	if s == other || len(s.sources) == 0 || len(other.sources) == 0 {
+		return true
+	}
+	return slices.ContainsFunc(s.sources, func(source string) bool {
+		return slices.Contains(other.sources, source)
+	})
+}
+
+// hashedKeyLen is the length of a base64url-encoded SHA-256 digest without padding.
+const hashedKeyLen = 43
+
+// storageKey returns the key the session with the given ID is stored under:
+// the ID itself unless StorageKeyPrefix or HashStorageKeys say otherwise. Every
+// read, write and delete of a session goes through it.
+//
+// Parameters:
+//   - id: The session ID the client holds.
+//
+// Returns:
+//   - string: The key to use with the storage.
+func (s *Store) storageKey(id string) string {
+	if s.HashStorageKeys {
+		sum := sha256.Sum256(utils.UnsafeBytes(id))
+		// One buffer of the exact size, handed over as the key: nothing writes to it
+		// afterwards, and it spares the second allocation a string conversion costs.
+		key := make([]byte, 0, len(s.StorageKeyPrefix)+hashedKeyLen)
+		key = append(key, s.StorageKeyPrefix...)
+		key = base64.RawURLEncoding.AppendEncode(key, sum[:])
+		return utils.UnsafeString(key)
+	}
+	if s.StorageKeyPrefix == "" {
+		return id
+	}
+	return s.StorageKeyPrefix + id
+}
+
+// requestIDPublisher returns the store that published the session ID cached on
+// the request, or nil if that is not known.
+//
+// The session middleware publishes the ID together with itself, so the middleware
+// still current in the request names the store, and costs the request nothing
+// extra. A session from Store.Get cannot be told apart that way, so it leaves its
+// store behind in sessionOwnerContextKey.
+func requestIDPublisher(c fiber.Ctx) *Store {
+	if m, ok := c.Locals(middlewareContextKey).(*Middleware); ok && m != nil {
+		return m.config.Store
+	}
+	if owner, ok := c.Locals(sessionOwnerContextKey).(*Store); ok {
+		return owner
+	}
+	return nil
+}
+
+// mayReuseRequestID reports whether the session ID and provenance cached on the
+// request were published by a store that shares a cookie or header with s.
+func (s *Store) mayReuseRequestID(c fiber.Ctx) bool {
+	if publisher := requestIDPublisher(c); publisher != nil && !s.sharesSource(publisher) {
+		return false
+	}
+	box, ok := c.Locals(sessionExtractorContextKey).(*provenanceBox)
+	return !ok || box == nil || box.owner == nil || s.sharesSource(box.owner)
 }
 
 // NewStore creates a new session store with the provided configuration.
@@ -86,13 +196,15 @@ type Store struct {
 func NewStore(config ...Config) *Store {
 	// Set default config
 	cfg := configDefault(config...)
+	warnCookiePrefixes(&cfg)
 
 	if cfg.Storage == nil {
 		cfg.Storage = memory.New()
 	}
 
 	store := &Store{
-		Config: cfg,
+		Config:  cfg,
+		sources: writableSources(cfg.Extractor),
 	}
 
 	if cfg.AbsoluteTimeout > 0 {
@@ -141,7 +253,12 @@ func (s *Store) Get(c fiber.Ctx) (*Session, error) {
 		return nil, ErrSessionAlreadyLoadedByMiddleware
 	}
 
-	return s.getSession(c)
+	sess, err := s.getSession(c)
+	if err == nil && sess.isFresh {
+		// getSession has just cached the new ID on the request; say whose it is.
+		ctxlocal.Set(c, sessionOwnerContextKey, s)
+	}
+	return sess, err
 }
 
 // getSession retrieves a session based on the context.
@@ -165,6 +282,10 @@ func (s *Store) getSession(c fiber.Ctx) (*Session, error) {
 
 	var selectedExtractor extractors.Result
 	id, ok := c.Locals(sessionIDContextKey).(string)
+	if ok && !s.mayReuseRequestID(c) {
+		// Cached by a store over other cookies or headers: its ID is not ours.
+		ok = false
+	}
 	if !ok {
 		var resolveErr error
 		selectedExtractor, resolveErr = s.getSessionID(c)
@@ -175,7 +296,7 @@ func (s *Store) getSession(c fiber.Ctx) (*Session, error) {
 		if id != "" {
 			// Kept for a second getSession on the same request, which takes the
 			// cached-ID path above and would otherwise lose the provenance.
-			storeProvenance(c, selectedExtractor)
+			storeProvenance(c, s, selectedExtractor)
 		}
 	} else if stored, found := c.Locals(sessionExtractorContextKey).(*provenanceBox); found && stored != nil {
 		selectedExtractor = stored.res
@@ -185,7 +306,7 @@ func (s *Store) getSession(c fiber.Ctx) (*Session, error) {
 
 	// Attempt to fetch session data if an ID is provided
 	if id != "" {
-		rawData, err = s.Storage.GetWithContext(c, id)
+		rawData, err = s.Storage.GetWithContext(c, s.storageKey(id))
 		if err != nil {
 			return nil, err
 		}
@@ -311,7 +432,7 @@ func (s *Store) Delete(ctx context.Context, id string) error {
 	if id == "" {
 		return ErrEmptySessionID
 	}
-	return s.Storage.DeleteWithContext(ctx, id)
+	return s.Storage.DeleteWithContext(ctx, s.storageKey(id))
 }
 
 // GetByID retrieves a session by its ID from the storage.
@@ -352,7 +473,7 @@ func (s *Store) GetByID(ctx context.Context, id string) (*Session, error) {
 		return nil, ErrEmptySessionID
 	}
 
-	rawData, err := s.Storage.GetWithContext(ctx, id)
+	rawData, err := s.Storage.GetWithContext(ctx, s.storageKey(id))
 	if err != nil {
 		return nil, err
 	}
