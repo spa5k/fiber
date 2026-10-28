@@ -140,19 +140,25 @@ const hashedKeyLen = 43
 // Returns:
 //   - string: The key to use with the storage.
 func (s *Store) storageKey(id string) string {
-	if s.HashStorageKeys {
-		sum := sha256.Sum256(utils.UnsafeBytes(id))
-		// One buffer of the exact size, handed over as the key: nothing writes to it
-		// afterwards, and it spares the second allocation a string conversion costs.
-		key := make([]byte, 0, len(s.StorageKeyPrefix)+hashedKeyLen)
-		key = append(key, s.StorageKeyPrefix...)
-		key = base64.RawURLEncoding.AppendEncode(key, sum[:])
-		return utils.UnsafeString(key)
-	}
-	if s.StorageKeyPrefix == "" {
+	// The default is the common case, and kept small enough to inline.
+	if s.StorageKeyPrefix == "" && !s.HashStorageKeys {
 		return id
 	}
-	return s.StorageKeyPrefix + id
+	return s.derivedStorageKey(id)
+}
+
+// derivedStorageKey is storageKey for a store with a prefix or hashing.
+func (s *Store) derivedStorageKey(id string) string {
+	if !s.HashStorageKeys {
+		return s.StorageKeyPrefix + id
+	}
+	sum := sha256.Sum256(utils.UnsafeBytes(id))
+	// One buffer of the exact size, handed over as the key: nothing writes to it
+	// afterwards, and it spares the second allocation a string conversion costs.
+	key := make([]byte, 0, len(s.StorageKeyPrefix)+hashedKeyLen)
+	key = append(key, s.StorageKeyPrefix...)
+	key = base64.RawURLEncoding.AppendEncode(key, sum[:])
+	return utils.UnsafeString(key)
 }
 
 // requestIDPublisher returns the store that published the session ID cached on
@@ -177,14 +183,25 @@ func requestIDPublisher(c fiber.Ctx) *Store {
 	return nil
 }
 
+// requestProvenance returns the provenance box cached on the request, nil if
+// there is none.
+func requestProvenance(c fiber.Ctx) *provenanceBox {
+	box, ok := c.Locals(sessionExtractorContextKey).(*provenanceBox)
+	if !ok {
+		return nil
+	}
+	return box
+}
+
 // mayReuseRequestID reports whether the session ID and provenance cached on the
-// request were published by a store that shares a cookie or header with s.
-func (s *Store) mayReuseRequestID(c fiber.Ctx) bool {
-	if publisher := requestIDPublisher(c); publisher != nil && !s.sharesSource(publisher) {
+// request, the latter in box, were published by a store that shares a cookie or
+// header with s.
+func (s *Store) mayReuseRequestID(c fiber.Ctx, box *provenanceBox) bool {
+	if box != nil && box.owner != nil && !s.sharesSource(box.owner) {
 		return false
 	}
-	box, ok := c.Locals(sessionExtractorContextKey).(*provenanceBox)
-	return !ok || box == nil || box.owner == nil || s.sharesSource(box.owner)
+	publisher := requestIDPublisher(c)
+	return publisher == nil || s.sharesSource(publisher)
 }
 
 // NewStore creates a new session store with the provided configuration.
@@ -290,9 +307,13 @@ func (s *Store) getSession(c fiber.Ctx) (*Session, error) {
 
 	var selectedExtractor extractors.Result
 	id, ok := c.Locals(sessionIDContextKey).(string)
-	if ok && !s.mayReuseRequestID(c) {
-		// Cached by a store over other cookies or headers: its ID is not ours.
-		ok = false
+	var cached *provenanceBox
+	if ok {
+		cached = requestProvenance(c)
+		if !s.mayReuseRequestID(c, cached) {
+			// Cached by a store over other cookies or headers: its ID is not ours.
+			ok = false
+		}
 	}
 	if !ok {
 		var resolveErr error
@@ -306,8 +327,8 @@ func (s *Store) getSession(c fiber.Ctx) (*Session, error) {
 			// cached-ID path above and would otherwise lose the provenance.
 			storeProvenance(c, s, selectedExtractor)
 		}
-	} else if stored, found := c.Locals(sessionExtractorContextKey).(*provenanceBox); found && stored != nil {
-		selectedExtractor = stored.res
+	} else if cached != nil {
+		selectedExtractor = cached.res
 	}
 
 	isFresh := false // Session is not fresh initially; only set to true if we generate a new ID
