@@ -19,15 +19,16 @@ import (
 // Session serializes access to its internal state with mutexes, but it is
 // request-scoped and must not be used after the request lifecycle ends.
 type Session struct {
-	ctx         fiber.Ctx         // fiber context of the request; read it with requestCtx, forgetContext clears it
-	config      *Store            // store configuration
-	data        *data             // key value data
-	rawData     []byte            // snapshot from the last decode, reused by Save while the data is unchanged
-	id          string            // session id
-	extractor   extractors.Result // provenance of the extractor that supplied the session ID
-	idleTimeout time.Duration     // idleTimeout of this session
-	mu          sync.RWMutex      // Mutex to protect non-data fields
-	isFresh     bool              // if new session
+	ctx         fiber.Ctx               // fiber context of the request; read it with requestCtx, forgetContext clears it
+	config      *Store                  // store configuration
+	data        *data                   // key value data
+	rawData     []byte                  // snapshot from the last decode, reused by Save while the data is unchanged
+	id          string                  // session id
+	extractor   extractors.Result       // provenance of the extractor that supplied the session ID
+	sink        [1]extractors.Extractor // backs the one-element result of getExtractorInfo
+	idleTimeout time.Duration           // idleTimeout of this session
+	mu          sync.RWMutex            // Mutex to protect non-data fields
+	isFresh     bool                    // if new session
 }
 
 type absExpirationKeyType int
@@ -498,10 +499,15 @@ const minLifetime = time.Second
 // Returns:
 //   - time.Duration: The time to live for the storage and the cookie.
 func (s *Session) lifetime() time.Duration {
-	ttl := s.idleTimeout
 	if s.config.AbsoluteTimeout <= 0 {
-		return ttl
+		return s.idleTimeout
 	}
+	return s.cappedLifetime()
+}
+
+// cappedLifetime is lifetime for a store with an absolute timeout.
+func (s *Session) cappedLifetime() time.Duration {
+	ttl := s.idleTimeout
 	deadline := s.absExpiration()
 	if deadline.IsZero() {
 		return ttl
@@ -579,7 +585,9 @@ func (s *Session) AbsoluteExpiry() (time.Time, bool) {
 	return expiry, !expiry.IsZero()
 }
 
-// getExtractorInfo returns all cookie and header extractors from the chain
+// getExtractorInfo returns the cookie and header extractors the session ID is
+// written to. The slice is only good until the next call, and must not be
+// modified: it is the store's own, or backed by the session.
 func (s *Session) getExtractorInfo() []extractors.Extractor {
 	if s.config == nil {
 		return []extractors.Extractor{{Source: extractors.SourceCookie, Key: "session_id"}} // Safe default
@@ -599,7 +607,8 @@ func (s *Session) getExtractorInfo() []extractors.Extractor {
 			switch s.extractor.Source {
 			case extractors.SourceCookie, extractors.SourceHeader:
 				// The ID came from a writable sink; write it back to the same place.
-				return []extractors.Extractor{{Key: s.extractor.Key, Source: s.extractor.Source}}
+				s.sink[0] = extractors.Extractor{Key: s.extractor.Key, Source: s.extractor.Source}
+				return s.sink[:]
 			case extractors.SourceAuthHeader, extractors.SourceForm,
 				extractors.SourceQuery, extractors.SourceParam, extractors.SourceCustom:
 				// Read-only: fall through to the refusal below.
@@ -614,23 +623,7 @@ func (s *Session) getExtractorInfo() []extractors.Extractor {
 		}
 	}
 
-	// Walked rather than ranged over Chain: a nested chain reports its first
-	// child's metadata, so direct children alone hide every sink inside it, and
-	// a cookie one level down would never be written.
-	var sinks []extractors.Extractor
-	s.config.Extractor.Walk(func(candidate extractors.Extractor) bool {
-		// Only a leaf names a place to write, and a keyless one would name a
-		// cookie or header with no name at all.
-		if len(candidate.Chain) > 0 || candidate.Key == "" {
-			return true
-		}
-		if candidate.Source == extractors.SourceCookie || candidate.Source == extractors.SourceHeader {
-			sinks = append(sinks, candidate)
-		}
-		return true
-	})
-
-	return sinks
+	return s.config.writableSinks()
 }
 
 // setSession writes the session ID to the response, with a lifetime of ttl.
